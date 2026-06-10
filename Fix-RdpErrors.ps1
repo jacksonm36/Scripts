@@ -45,11 +45,11 @@ $script:IssuesFound = 0
 $script:IssuesFixed = 0
 $script:Warnings    = [System.Collections.Generic.List[string]]::new()
 
-# Well-known SID for the built-in "Remote Desktop Users" group (locale-independent).
+# Well-known SID for the built-in Remote Desktop Users group (locale-independent).
 $script:RdpUsersGroupSid = 'S-1-5-32-555'
-$script:ScriptVersion    = '2.1'
+$script:ScriptVersion    = '2.2'
 
-# ── output helpers ──────────────────────────────────────────────────────────
+# --- output helpers ---
 
 function Write-Section ([string]$Title) {
     Write-Host ""
@@ -63,8 +63,7 @@ function Write-Fixed ([string]$Msg) { $script:IssuesFixed++
 function Write-Warn  ([string]$Msg) { $script:Warnings.Add($Msg)
                                       Write-Host "[WARN] $Msg" -ForegroundColor Yellow  }
 
-# ── fix helper ───────────────────────────────────────────────────────────────
-# Uses $script: scope variables to avoid PowerShell scriptblock scoping issues.
+# --- fix helper ---
 
 function Invoke-Fix ([string]$Description, [scriptblock]$Action) {
     if (-not $Fix) {
@@ -75,7 +74,7 @@ function Invoke-Fix ([string]$Description, [scriptblock]$Action) {
     catch { Write-Warn "Could not fix '$Description': $($_.Exception.Message)" }
 }
 
-# ── admin check ──────────────────────────────────────────────────────────────
+# --- admin check ---
 
 function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -83,23 +82,23 @@ function Test-IsAdmin {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-# ── registry helpers ─────────────────────────────────────────────────────────
+# --- registry helpers ---
 
 function Get-RegValue ([string]$Path, [string]$Name) {
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
     (Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction SilentlyContinue).$Name
 }
 
-# ── port helper ───────────────────────────────────────────────────────────────
+# --- port helper ---
 
 function Test-PortListening ([int]$TcpPort) {
     $c = Get-NetTCPConnection -LocalPort $TcpPort -State Listen -ErrorAction SilentlyContinue
     [bool]($c | Where-Object { $_.LocalAddress -in '0.0.0.0','::','[::]' })
 }
 
-# ── firewall helpers ──────────────────────────────────────────────────────────
+# --- firewall helpers ---
 # NOTE: DisplayGroup / DisplayName are localised on non-English Windows.
-#       Rule Name values are never localised — always use those.
+#       Rule Name values are never localised - always use those.
 
 $script:RdpRuleNames = @(
     'RemoteDesktop-UserMode-In-TCP'
@@ -123,29 +122,49 @@ function Test-RuleAllowsTcpPort {
 function Get-RdpRules {
     param([int]$TcpPort = 3389)
 
-    # Fetch all firewall rules once. Never use DisplayGroup — it is localised
-    # (e.g. Hungarian "Távoli asztal" vs English "Remote Desktop").
     $all = @(Get-NetFirewallRule -ErrorAction SilentlyContinue)
     if ($all.Count -eq 0) { return @() }
 
     $byName = @($all | Where-Object { $_.Name -in $script:RdpRuleNames })
     if ($byName.Count -gt 0) { return $byName }
 
-    # Fallback: any inbound allow rule that opens the RDP TCP port.
     @($all | Where-Object {
         $_.Direction -eq 'Inbound' -and $_.Action -eq 'Allow' -and
         (Test-RuleAllowsTcpPort -Rule $_ -TcpPort $TcpPort)
     })
 }
 
-# ── user helper (locale-independent via well-known SID) ───────────────────────
+function Enable-OrCreateRdpFirewallRule {
+    param([int]$TcpPort)
+
+    foreach ($n in $script:RdpRuleNames) {
+        $r = Get-NetFirewallRule -Name $n -ErrorAction SilentlyContinue
+        if ($r) {
+            Enable-NetFirewallRule -Name $n -ErrorAction Stop
+            return
+        }
+    }
+
+    $customName = 'RemoteDesktop-UserMode-In-TCP-Custom'
+    if (-not (Get-NetFirewallRule -Name $customName -ErrorAction SilentlyContinue)) {
+        New-NetFirewallRule `
+            -Name        $customName `
+            -DisplayName "Remote Desktop - TCP In ($TcpPort)" `
+            -Direction   Inbound `
+            -Protocol    TCP `
+            -LocalPort   $TcpPort `
+            -Action      Allow `
+            -Profile     Any `
+            -Enabled     True | Out-Null
+    }
+    else {
+        Enable-NetFirewallRule -Name $customName -ErrorAction Stop
+    }
+}
+
+# --- user helper (locale-independent via well-known SID) ---
 
 function Get-RdpUsersGroup {
-  <#
-    Returns the local Remote Desktop Users group object.
-    Uses the well-known SID so this works on Hungarian and other localised Windows
-    where the display name differs (e.g. "Távoli asztal felhasználói").
-  #>
     try {
         return Get-LocalGroup -SID $script:RdpUsersGroupSid -ErrorAction Stop
     }
@@ -175,8 +194,7 @@ function Test-InRdpGroup ([string]$AccountName) {
     }
 }
 
-# ── event log helper (locale-independent provider / log names) ────────────────
-# EventLogException can bypass -ErrorAction; isolate queries and swallow misses.
+# --- event log helper ---
 
 function Get-RecentProviderEvents {
     param(
@@ -187,24 +205,19 @@ function Get-RecentProviderEvents {
     )
 
     $events = @()
-
-    # FilterXPath avoids FilterHashtable parameter issues on some localised builds.
     $utcSince = $Since.ToUniversalTime().ToString('o')
-    $xpath = @"
-*[System[
-    Provider[@Name='$ProviderName']
-    and (Level=2 or Level=3)
-    and TimeCreated[@SystemTime>='$utcSince']
-]]
-"@
+
+    # Build XPath as a normal string (no here-string; avoids parser issues on PS 5.1).
+    $xpath = "*[System[Provider[@Name='" + $ProviderName + "'] and (Level=2 or Level=3) and TimeCreated[@SystemTime>='" + $utcSince + "']]]"
 
     try {
         $events = @(Get-WinEvent -LogName $LogName -FilterXPath $xpath -MaxEvents $MaxEvents -ErrorAction Stop)
         if ($events.Count -gt 0) { return $events }
     }
-    catch { <# XPath or provider not available — try fallback #> }
+    catch {
+        # XPath or provider not available
+    }
 
-    # Fallback: direct provider query then filter in PowerShell.
     try {
         $prevEap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
@@ -213,28 +226,33 @@ function Get-RecentProviderEvents {
             Select-Object -First $MaxEvents)
         if ($events.Count -gt 0) { return $events }
     }
-    catch { <# no events or provider missing #> }
-    finally { $ErrorActionPreference = $prevEap }
+    catch {
+        # no events or provider missing
+    }
+    finally {
+        $ErrorActionPreference = $prevEap
+    }
 
-    # Last resort: legacy Get-EventLog API (often works when Get-WinEvent fails).
     try {
         $prevEap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         $events = @(Get-EventLog -LogName $LogName -Source $ProviderName -After $Since `
             -EntryType Error, Warning -Newest $MaxEvents -ErrorAction SilentlyContinue)
     }
-    catch { <# source not registered in classic log #> }
-    finally { $ErrorActionPreference = $prevEap }
+    catch {
+        # source not registered in classic log
+    }
+    finally {
+        $ErrorActionPreference = $prevEap
+    }
 
     return $events
 }
 
-# ════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ════════════════════════════════════════════════════════════════════════════
+# --- MAIN ---
 
 Write-Section "RDP Health Check"
-Write-Host "Version  : $($script:ScriptVersion) (locale-safe; no DisplayGroup / FilterHashtable)"
+Write-Host "Version  : $($script:ScriptVersion) (locale-safe)"
 Write-Host "Mode     : $(if ($Fix) {'CHECK + FIX'} else {'CHECK ONLY'})"
 Write-Host "Computer : $env:COMPUTERNAME"
 Write-Host "OS       : $((Get-CimInstance Win32_OperatingSystem).Caption)"
@@ -245,10 +263,10 @@ if ($Fix -and -not $isAdmin) {
     exit 1
 }
 if (-not $isAdmin) {
-    Write-Warn "Not running as Administrator — some checks may be incomplete."
+    Write-Warn "Not running as Administrator - some checks may be incomplete."
 }
 
-# ── 1. Remote Desktop enabled ─────────────────────────────────────────────
+# --- 1. Remote Desktop enabled ---
 
 Write-Section "Remote Desktop Setting"
 
@@ -268,7 +286,7 @@ else {
     Write-Ok "Remote Desktop is enabled."
 }
 
-# ── 2. TermService ────────────────────────────────────────────────────────
+# --- 2. TermService ---
 
 Write-Section "Remote Desktop Services (TermService)"
 
@@ -311,8 +329,7 @@ else {
     }
 }
 
-# ── 3. Firewall ────────────────────────────────────────────────────────────
-# Rule names are used exclusively — DisplayGroup is locale-dependent.
+# --- 3. Firewall ---
 
 Write-Section "Windows Firewall"
 
@@ -321,7 +338,6 @@ foreach ($p in (Get-NetFirewallProfile -ErrorAction SilentlyContinue)) {
     else            { Write-Warn "Firewall profile '$($p.Name)' is disabled." }
 }
 
-# Resolve configured RDP port early so firewall checks use the same port.
 $rdpTcpPathEarly = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
 $configuredPortEarly = Get-RegValue $rdpTcpPathEarly 'PortNumber'
 if ($null -ne $configuredPortEarly) { $Port = [int]$configuredPortEarly }
@@ -331,33 +347,7 @@ $script:RdpRules = Get-RdpRules -TcpPort $Port
 if ($script:RdpRules.Count -eq 0) {
     Write-Issue "No Remote Desktop firewall rules found (by rule Name or TCP port $Port)."
     Invoke-Fix "Enabled or created inbound Remote Desktop firewall rule for port $Port." {
-        # Try to enable the canonical rules first — they may exist but be disabled.
-        $anyEnabled = $false
-        foreach ($n in $script:RdpRuleNames) {
-            $r = Get-NetFirewallRule -Name $n -ErrorAction SilentlyContinue
-            if ($r) {
-                Enable-NetFirewallRule -Name $n -ErrorAction Stop
-                $anyEnabled = $true
-            }
-        }
-        # If none of the canonical rules exist at all, create a custom one.
-        if (-not $anyEnabled) {
-            $customName = 'RemoteDesktop-UserMode-In-TCP-Custom'
-            if (-not (Get-NetFirewallRule -Name $customName -ErrorAction SilentlyContinue)) {
-                New-NetFirewallRule `
-                    -Name        $customName `
-                    -DisplayName "Remote Desktop - TCP In ($Port)" `
-                    -Direction   Inbound `
-                    -Protocol    TCP `
-                    -LocalPort   $Port `
-                    -Action      Allow `
-                    -Profile     Any `
-                    -Enabled     True | Out-Null
-            }
-            else {
-                Enable-NetFirewallRule -Name $customName -ErrorAction Stop
-            }
-        }
+        Enable-OrCreateRdpFirewallRule -TcpPort $Port
     }
 }
 else {
@@ -376,7 +366,7 @@ else {
     }
 }
 
-# ── 4. Port listener ───────────────────────────────────────────────────────
+# --- 4. Port listener ---
 
 Write-Section "RDP Port Listener"
 
@@ -396,7 +386,7 @@ else {
     }
 }
 
-# ── 5. RDP-Tcp registry ────────────────────────────────────────────────────
+# --- 5. RDP-Tcp registry ---
 
 Write-Section "RDP-Tcp Configuration"
 
@@ -413,7 +403,7 @@ else {
     }
 }
 
-# ── 6. Group Policy override ───────────────────────────────────────────────
+# --- 6. Group Policy override ---
 
 Write-Section "Policy Overrides"
 
@@ -428,7 +418,7 @@ else {
     Write-Ok "No Group Policy block detected."
 }
 
-# ── 7. User permission ─────────────────────────────────────────────────────
+# --- 7. User permission ---
 
 if ($User) {
     Write-Section "User Permission Check"
@@ -453,7 +443,7 @@ if ($User) {
     }
 }
 
-# ── 8. Recent event log errors ─────────────────────────────────────────────
+# --- 8. Recent event log errors ---
 
 Write-Section "Recent Event Log Errors (last 24 h)"
 
@@ -489,7 +479,7 @@ if (-not $anyEvents) {
     Write-Ok "No recent TermService / RemoteConnectionManager errors in the System log."
 }
 
-# ── summary ────────────────────────────────────────────────────────────────
+# --- summary ---
 
 Write-Section "Summary"
 Write-Host "Issues found : $script:IssuesFound"
