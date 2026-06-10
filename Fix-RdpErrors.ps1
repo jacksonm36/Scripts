@@ -47,6 +47,7 @@ $script:Warnings    = [System.Collections.Generic.List[string]]::new()
 
 # Well-known SID for the built-in "Remote Desktop Users" group (locale-independent).
 $script:RdpUsersGroupSid = 'S-1-5-32-555'
+$script:ScriptVersion    = '2.1'
 
 # ── output helpers ──────────────────────────────────────────────────────────
 
@@ -106,12 +107,35 @@ $script:RdpRuleNames = @(
     'RemoteDesktop-Shadow-In-TCP'
 )
 
+function Test-RuleAllowsTcpPort {
+    param(
+        [object]$Rule,
+        [int]$TcpPort
+    )
+
+    $pf = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $Rule -ErrorAction SilentlyContinue
+    if (-not $pf -or $pf.Protocol -ne 'TCP') { return $false }
+
+    $ports = @($pf.LocalPort -split ',' | ForEach-Object { $_.Trim() })
+    return ($ports -contains 'Any') -or ($ports -contains '*') -or ($ports -contains "$TcpPort")
+}
+
 function Get-RdpRules {
-    # Fetch all firewall rules once, then filter by the canonical Name list.
-    # This avoids any DisplayGroup / DisplayName locale dependency.
-    $all = Get-NetFirewallRule -ErrorAction SilentlyContinue
-    if (-not $all) { return @() }
-    @($all | Where-Object { $_.Name -in $script:RdpRuleNames })
+    param([int]$TcpPort = 3389)
+
+    # Fetch all firewall rules once. Never use DisplayGroup — it is localised
+    # (e.g. Hungarian "Távoli asztal" vs English "Remote Desktop").
+    $all = @(Get-NetFirewallRule -ErrorAction SilentlyContinue)
+    if ($all.Count -eq 0) { return @() }
+
+    $byName = @($all | Where-Object { $_.Name -in $script:RdpRuleNames })
+    if ($byName.Count -gt 0) { return $byName }
+
+    # Fallback: any inbound allow rule that opens the RDP TCP port.
+    @($all | Where-Object {
+        $_.Direction -eq 'Inbound' -and $_.Action -eq 'Allow' -and
+        (Test-RuleAllowsTcpPort -Rule $_ -TcpPort $TcpPort)
+    })
 }
 
 # ── user helper (locale-independent via well-known SID) ───────────────────────
@@ -187,8 +211,19 @@ function Get-RecentProviderEvents {
         $events = @(Get-WinEvent -LogName $LogName -ProviderName $ProviderName -MaxEvents 200 -ErrorAction SilentlyContinue |
             Where-Object { $_.Level -in 2, 3 -and $_.TimeCreated -ge $Since } |
             Select-Object -First $MaxEvents)
+        if ($events.Count -gt 0) { return $events }
     }
     catch { <# no events or provider missing #> }
+    finally { $ErrorActionPreference = $prevEap }
+
+    # Last resort: legacy Get-EventLog API (often works when Get-WinEvent fails).
+    try {
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $events = @(Get-EventLog -LogName $LogName -Source $ProviderName -After $Since `
+            -EntryType Error, Warning -Newest $MaxEvents -ErrorAction SilentlyContinue)
+    }
+    catch { <# source not registered in classic log #> }
     finally { $ErrorActionPreference = $prevEap }
 
     return $events
@@ -199,6 +234,7 @@ function Get-RecentProviderEvents {
 # ════════════════════════════════════════════════════════════════════════════
 
 Write-Section "RDP Health Check"
+Write-Host "Version  : $($script:ScriptVersion) (locale-safe; no DisplayGroup / FilterHashtable)"
 Write-Host "Mode     : $(if ($Fix) {'CHECK + FIX'} else {'CHECK ONLY'})"
 Write-Host "Computer : $env:COMPUTERNAME"
 Write-Host "OS       : $((Get-CimInstance Win32_OperatingSystem).Caption)"
@@ -285,11 +321,16 @@ foreach ($p in (Get-NetFirewallProfile -ErrorAction SilentlyContinue)) {
     else            { Write-Warn "Firewall profile '$($p.Name)' is disabled." }
 }
 
-$script:RdpRules = Get-RdpRules
+# Resolve configured RDP port early so firewall checks use the same port.
+$rdpTcpPathEarly = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+$configuredPortEarly = Get-RegValue $rdpTcpPathEarly 'PortNumber'
+if ($null -ne $configuredPortEarly) { $Port = [int]$configuredPortEarly }
+
+$script:RdpRules = Get-RdpRules -TcpPort $Port
 
 if ($script:RdpRules.Count -eq 0) {
-    Write-Issue "No Remote Desktop firewall rules found (checked by rule Name)."
-    Invoke-Fix "Created inbound Remote Desktop firewall rule for port $Port." {
+    Write-Issue "No Remote Desktop firewall rules found (by rule Name or TCP port $Port)."
+    Invoke-Fix "Enabled or created inbound Remote Desktop firewall rule for port $Port." {
         # Try to enable the canonical rules first — they may exist but be disabled.
         $anyEnabled = $false
         foreach ($n in $script:RdpRuleNames) {
@@ -339,12 +380,7 @@ else {
 
 Write-Section "RDP Port Listener"
 
-$rdpTcpPath    = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
-$configuredPort = Get-RegValue $rdpTcpPath 'PortNumber'
-if ($null -ne $configuredPort -and [int]$configuredPort -ne $Port) {
-    Write-Warn "Registry PortNumber is $configuredPort but -Port is $Port. Using registry value."
-    $Port = [int]$configuredPort
-}
+$rdpTcpPath = $rdpTcpPathEarly
 
 if (Test-PortListening $Port) {
     Write-Ok "Port $Port is listening."
@@ -428,18 +464,25 @@ $logSources = @(
 )
 $anyEvents = $false
 
-foreach ($src in $logSources) {
-    $evts = Get-RecentProviderEvents -LogName 'System' -ProviderName $src -Since $since -MaxEvents 5
+try {
+    foreach ($src in $logSources) {
+        $evts = Get-RecentProviderEvents -LogName 'System' -ProviderName $src -Since $since -MaxEvents 5
 
-    if ($evts -and $evts.Count -gt 0) {
-        $anyEvents = $true
-        Write-Warn "Recent $src events:"
-        foreach ($e in $evts) {
-            $line = ($e.Message -split "`n")[0]
-            Write-Host "       $($e.TimeCreated.ToString('yyyy-MM-dd HH:mm'))  Id=$($e.Id)  $line" `
-                -ForegroundColor DarkYellow
+        if ($evts -and $evts.Count -gt 0) {
+            $anyEvents = $true
+            Write-Warn "Recent $src events:"
+            foreach ($e in $evts) {
+                $line = ($e.Message -split "`n")[0]
+                $when = if ($e.TimeGenerated) { $e.TimeGenerated } else { $e.TimeCreated }
+                $id   = if ($e.EventID) { $e.EventID } else { $e.Id }
+                Write-Host "       $($when.ToString('yyyy-MM-dd HH:mm'))  Id=$id  $line" `
+                    -ForegroundColor DarkYellow
+            }
         }
     }
+}
+catch {
+    Write-Warn "Event log check skipped: $($_.Exception.Message)"
 }
 
 if (-not $anyEvents) {
